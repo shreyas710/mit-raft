@@ -36,11 +36,20 @@ type Raft struct {
 	// Persistent state (Figure 2)
 	currentTerm int
 	votedFor    int
-	log         []LogEntry
+	log         []LogEntry // log[0] is dummy; real entries start at index 1
+
+	// Volatile state on all servers
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders (reinitialized after election)
+	nextIndex  []int
+	matchIndex []int
 
 	state         int
 	electionTimer time.Time
 	applyCh       chan raftapi.ApplyMsg
+	applyCond     *sync.Cond
 }
 
 type LogEntry struct {
@@ -126,14 +135,22 @@ type RequestVoteReply struct {
 
 // AppendEntries RPC arguments structure.
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 // AppendEntries RPC reply structure.
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// Fast backup optimization
+	XTerm  int // term of conflicting entry
+	XIndex int // first index of XTerm
+	XLen   int // log length
 }
 
 func (rf *Raft) resetElectionTimer() {
@@ -165,10 +182,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// Check log is at least as up-to-date (§5.4.1)
 		lastLogIndex := len(rf.log) - 1
-		lastLogTerm := 0
-		if lastLogIndex >= 0 {
-			lastLogTerm = rf.log[lastLogIndex].Term
-		}
+		lastLogTerm := rf.log[lastLogIndex].Term
 		if args.LastLogTerm > lastLogTerm ||
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			rf.votedFor = args.CandidateId
@@ -197,6 +211,54 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.state = Follower
 	rf.resetElectionTimer()
 	reply.Term = rf.currentTerm
+
+	// Log consistency check
+	if args.PrevLogIndex >= len(rf.log) {
+		// Log too short
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = len(rf.log)
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Conflicting entry — find first index of the conflicting term
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XIndex = args.PrevLogIndex
+		for reply.XIndex > 0 && rf.log[reply.XIndex-1].Term == reply.XTerm {
+			reply.XIndex--
+		}
+		reply.XLen = len(rf.log)
+		rf.log = rf.log[:args.PrevLogIndex]
+		return
+	}
+
+	// Append new entries, handling conflicts
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx < len(rf.log) {
+			if rf.log[idx].Term != entry.Term {
+				rf.log = rf.log[:idx]
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+		} else {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+	}
+
+	// Advance commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		lastNewIndex := args.PrevLogIndex + len(args.Entries)
+		if args.LeaderCommit < lastNewIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastNewIndex
+		}
+		rf.applyCond.Signal()
+	}
+
 	reply.Success = true
 }
 
@@ -249,13 +311,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (3B).
+	if rf.state != Leader {
+		return -1, rf.currentTerm, false
+	}
 
-	return index, term, isLeader
+	entry := LogEntry{Term: rf.currentTerm, Command: command}
+	rf.log = append(rf.log, entry)
+	index := len(rf.log) - 1
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+
+	return index, rf.currentTerm, true
 }
 
 func (rf *Raft) ticker() {
@@ -293,22 +362,79 @@ func (rf *Raft) sendHeartbeats() {
 		if i == me {
 			continue
 		}
-		go func(server int) {
-			args := &AppendEntriesArgs{
-				Term:     term,
-				LeaderId: me,
-			}
-			reply := &AppendEntriesReply{}
-			if rf.sendAppendEntries(server, args, reply) {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.state = Follower
-					rf.votedFor = -1
+		go rf.sendLogEntries(i, term)
+	}
+}
+
+func (rf *Raft) sendLogEntries(server int, term int) {
+	rf.mu.Lock()
+	if rf.state != Leader || rf.currentTerm != term {
+		rf.mu.Unlock()
+		return
+	}
+	prevLogIndex := rf.nextIndex[server] - 1
+	prevLogTerm := rf.log[prevLogIndex].Term
+	entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+	copy(entries, rf.log[prevLogIndex+1:])
+	args := &AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+
+	reply := &AppendEntriesReply{}
+	if !rf.sendAppendEntries(server, args, reply) {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		return
+	}
+
+	if rf.state != Leader || rf.currentTerm != term {
+		return
+	}
+
+	if reply.Success {
+		newMatchIndex := args.PrevLogIndex + len(args.Entries)
+		if newMatchIndex > rf.matchIndex[server] {
+			rf.matchIndex[server] = newMatchIndex
+		}
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		rf.advanceCommitIndex()
+	} else {
+		// Fast backup
+		if reply.XTerm == -1 {
+			// Follower's log is too short
+			rf.nextIndex[server] = reply.XLen
+		} else {
+			// Search for XTerm in leader's log
+			found := -1
+			for i := len(rf.log) - 1; i > 0; i-- {
+				if rf.log[i].Term == reply.XTerm {
+					found = i
+					break
 				}
 			}
-		}(i)
+			if found > 0 {
+				rf.nextIndex[server] = found + 1
+			} else {
+				rf.nextIndex[server] = reply.XIndex
+			}
+		}
+		if rf.nextIndex[server] < 1 {
+			rf.nextIndex[server] = 1
+		}
 	}
 }
 
@@ -321,10 +447,7 @@ func (rf *Raft) startElection() {
 	term := rf.currentTerm
 	me := rf.me
 	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := 0
-	if lastLogIndex >= 0 {
-		lastLogTerm = rf.log[lastLogIndex].Term
-	}
+	lastLogTerm := rf.log[lastLogIndex].Term
 	rf.mu.Unlock()
 
 	votes := int32(1) // vote for self
@@ -357,6 +480,14 @@ func (rf *Raft) startElection() {
 					newVotes := atomic.AddInt32(&votes, 1)
 					if int(newVotes) > len(rf.peers)/2 && rf.state == Candidate {
 						rf.state = Leader
+						// Initialize leader volatile state
+						rf.nextIndex = make([]int, len(rf.peers))
+						rf.matchIndex = make([]int, len(rf.peers))
+						for i := range rf.peers {
+							rf.nextIndex[i] = len(rf.log)
+							rf.matchIndex[i] = 0
+						}
+						rf.matchIndex[rf.me] = len(rf.log) - 1
 						go rf.sendHeartbeats()
 					}
 				}
@@ -384,9 +515,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Initialize state
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]LogEntry, 0)
+	rf.log = []LogEntry{{Term: 0}} // dummy entry at index 0
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	rf.state = Follower
 	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.resetElectionTimer()
 
 	// initialize from state persisted before a crash
@@ -394,6 +528,50 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applier()
 
 	return rf
+}
+
+func (rf *Raft) advanceCommitIndex() {
+	// Find highest N where majority of matchIndex[i] >= N
+	// and log[N].term == currentTerm (Figure 2, Leaders rule)
+	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
+		if rf.log[n].Term != rf.currentTerm {
+			continue
+		}
+		count := 1 // count self
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= n {
+				count++
+			}
+		}
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = n
+			rf.applyCond.Signal()
+			break
+		}
+	}
+}
+
+func (rf *Raft) applier() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for {
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+		}
+	}
 }
